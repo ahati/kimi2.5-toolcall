@@ -1,0 +1,487 @@
+package handler
+
+import (
+	"ai-proxy/internal/config"
+	"ai-proxy/internal/metrics"
+	"ai-proxy/internal/proxy"
+	"ai-proxy/internal/transformer"
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Handler struct {
+	proxy   *proxy.Proxy
+	config  *config.Config
+	metrics *metrics.Metrics
+}
+
+func New(p *proxy.Proxy, cfg *config.Config, m *metrics.Metrics) *Handler {
+	return &Handler{
+		proxy:   p,
+		config:  cfg,
+		metrics: m,
+	}
+}
+
+func (h *Handler) ChatCompletions(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Failed to read request body"))
+		return
+	}
+	defer c.Request.Body.Close()
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Invalid JSON"))
+		return
+	}
+
+	model, _ := req["model"].(string)
+	if model == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "model is required"))
+		return
+	}
+
+	route, err := h.proxy.Route(model)
+	if err != nil {
+		if pe, ok := err.(*proxy.ProxyError); ok {
+			c.JSON(http.StatusBadRequest, NewErrorResponse(pe.Code, pe.Message))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", err.Error()))
+		return
+	}
+
+	for _, t := range route.ReqTransformers {
+		bodyBytes, err = t.TransformRequest(bodyBytes, route.StrippedModel)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, NewErrorResponse("transform_error", "Request transformation failed: "+err.Error()))
+			return
+		}
+	}
+
+	req["model"] = route.StrippedModel
+
+	bodyBytes, err = json.Marshal(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to serialize request"))
+		return
+	}
+
+	// Count input tokens from request
+	inputTokens := h.countTokens(req)
+
+	upstreamURL := route.Upstream.Endpoint + "/chat/completions"
+	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to create upstream request"))
+		return
+	}
+
+	upstreamReq.Header = make(http.Header)
+	for k, v := range c.Request.Header {
+		if strings.ToLower(k) == "host" {
+			continue
+		}
+		upstreamReq.Header[k] = v
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+route.Upstream.APIKey)
+
+	// Start timing
+	startTime := time.Now()
+
+	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	respBody, _ := io.ReadAll(upstreamResp.Body)
+
+	// Calculate latency
+	latencyMs := time.Since(startTime).Milliseconds()
+
+	isStreaming := false
+	if s, ok := req["stream"].(bool); ok && s {
+		isStreaming = true
+	}
+
+	hasStreamingTransformer := hasStreamingTransformer(route.RespTransformers)
+
+	if isStreaming && hasStreamingTransformer {
+		h.handleStreaming(c, upstreamURL, bodyBytes, route, startTime)
+		return
+	}
+
+	for _, t := range route.RespTransformers {
+		respBody, err = t.TransformResponse(respBody, isStreaming)
+		if err != nil {
+			// Log but continue
+		}
+	}
+
+	// Count output tokens from response
+	outputTokens := h.countResponseTokens(respBody)
+
+	// Record metrics
+	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, inputTokens, outputTokens)
+
+	for k, v := range upstreamResp.Header {
+		if strings.ToLower(k) == "transfer-encoding" {
+			continue
+		}
+		c.Header(k, v[0])
+	}
+
+	c.Data(upstreamResp.StatusCode, upstreamResp.Header.Get("Content-Type"), respBody)
+}
+
+func (h *Handler) AnthropicMessages(c *gin.Context) {
+	bodyBytes, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Failed to read request body"))
+		return
+	}
+	defer c.Request.Body.Close()
+
+	var req map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Invalid JSON"))
+		return
+	}
+
+	model, _ := req["model"].(string)
+	if model == "" {
+		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "model is required"))
+		return
+	}
+
+	fullModel := "anthropic/" + model
+
+	route, err := h.proxy.Route(fullModel)
+	if err != nil {
+		if pe, ok := err.(*proxy.ProxyError); ok {
+			c.JSON(http.StatusBadRequest, NewErrorResponse(pe.Code, pe.Message))
+			return
+		}
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", err.Error()))
+		return
+	}
+
+	for _, t := range route.ReqTransformers {
+		bodyBytes, err = t.TransformRequest(bodyBytes, route.StrippedModel)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, NewErrorResponse("transform_error", "Request transformation failed: "+err.Error()))
+			return
+		}
+	}
+
+	req["model"] = route.StrippedModel
+
+	bodyBytes, err = json.Marshal(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to serialize request"))
+		return
+	}
+
+	upstreamURL := route.Upstream.Endpoint + "/chat/completions"
+	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to create upstream request"))
+		return
+	}
+
+	upstreamReq.Header = make(http.Header)
+	for k, v := range c.Request.Header {
+		if strings.ToLower(k) == "host" {
+			continue
+		}
+		upstreamReq.Header[k] = v
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+route.Upstream.APIKey)
+
+	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	respBody, _ := io.ReadAll(upstreamResp.Body)
+
+	isStreaming := false
+	if s, ok := req["stream"].(bool); ok && s {
+		isStreaming = true
+	}
+
+	for _, t := range route.RespTransformers {
+		respBody, err = t.TransformResponse(respBody, isStreaming)
+		if err != nil {
+		}
+	}
+
+	for k, v := range upstreamResp.Header {
+		if strings.ToLower(k) == "transfer-encoding" {
+			continue
+		}
+		c.Header(k, v[0])
+	}
+
+	c.Data(upstreamResp.StatusCode, upstreamResp.Header.Get("Content-Type"), respBody)
+}
+
+func (h *Handler) ListModels(c *gin.Context) {
+	models := []map[string]interface{}{}
+
+	for _, upstream := range h.config.Upstreams {
+		upstreamURL := upstream.Endpoint + "/models"
+		req, err := http.NewRequest("GET", upstreamURL, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+upstream.APIKey)
+
+		resp, err := h.proxy.HTTPClient().Do(req)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			for _, mc := range upstream.Models {
+				pattern := mc.Pattern
+				if pattern == "*" {
+					models = append(models, map[string]interface{}{
+						"id":       upstream.Provider + "/*",
+						"object":   "model",
+						"created":  1700000000,
+						"owned_by": upstream.Provider,
+					})
+				} else {
+					models = append(models, map[string]interface{}{
+						"id":       upstream.Provider + "/" + pattern,
+						"object":   "model",
+						"created":  1700000000,
+						"owned_by": upstream.Provider,
+					})
+				}
+			}
+			continue
+		}
+
+		var upstreamResp map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&upstreamResp); err != nil {
+			continue
+		}
+
+		if data, ok := upstreamResp["data"].([]interface{}); ok {
+			for _, m := range data {
+				if modelMap, ok := m.(map[string]interface{}); ok {
+					if id, ok := modelMap["id"].(string); ok {
+						modelMap["id"] = upstream.Provider + "/" + id
+						models = append(models, modelMap)
+					}
+				}
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   models,
+	})
+}
+
+func (h *Handler) Health(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+type ErrorDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Param   string `json:"param,omitempty"`
+	Code    string `json:"code,omitempty"`
+}
+
+type ErrorResponse struct {
+	Error ErrorDetail `json:"error"`
+}
+
+func NewErrorResponse(errType, message string) ErrorResponse {
+	return ErrorResponse{
+		Error: ErrorDetail{
+			Message: message,
+			Type:    errType,
+		},
+	}
+}
+
+func (h *Handler) countTokens(req map[string]interface{}) int64 {
+	var count int64
+
+	if messages, ok := req["messages"].([]interface{}); ok {
+		for _, msg := range messages {
+			if msgMap, ok := msg.(map[string]interface{}); ok {
+				if content, ok := msgMap["content"].(string); ok {
+					count += int64(len(content)) / 4
+				}
+			}
+		}
+	}
+
+	return count
+}
+
+func (h *Handler) countResponseTokens(respBody []byte) int64 {
+	var count int64
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(respBody, &resp); err == nil {
+		if choices, ok := resp["choices"].([]interface{}); ok {
+			for _, choice := range choices {
+				if choiceMap, ok := choice.(map[string]interface{}); ok {
+					if message, ok := choiceMap["message"].(map[string]interface{}); ok {
+						if content, ok := message["content"].(string); ok {
+							count += int64(len(content)) / 4
+						}
+					}
+				}
+			}
+		}
+		if usage, ok := resp["usage"].(map[string]interface{}); ok {
+			if completionTokens, ok := usage["completion_tokens"].(float64); ok {
+				count = int64(completionTokens)
+			}
+		}
+	}
+
+	return count
+}
+
+func (h *Handler) MetricsHandler(c *gin.Context) {
+	data, err := h.metrics.GetJSON()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to get metrics"))
+		return
+	}
+	c.Data(http.StatusOK, "application/json", data)
+}
+
+func hasStreamingTransformer(transformers []transformer.ResponseTransformer) bool {
+	for _, t := range transformers {
+		if _, ok := t.(transformer.StreamingTransformer); ok {
+			return true
+		}
+	}
+	return false
+}
+
+func getStreamingTransformers(transformers []transformer.ResponseTransformer) []transformer.StreamingTransformer {
+	var result []transformer.StreamingTransformer
+	for _, t := range transformers {
+		if st, ok := t.(transformer.StreamingTransformer); ok {
+			result = append(result, st)
+		}
+	}
+	return result
+}
+
+func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes []byte, route *proxy.RouteResult, startTime time.Time) {
+	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to create upstream request"))
+		return
+	}
+
+	upstreamReq.Header = make(http.Header)
+	for k, v := range c.Request.Header {
+		if strings.ToLower(k) == "host" {
+			continue
+		}
+		upstreamReq.Header[k] = v
+	}
+	upstreamReq.Header.Set("Authorization", "Bearer "+route.Upstream.APIKey)
+	upstreamReq.Header.Set("Accept", "text/event-stream")
+	upstreamReq.Header.Set("Cache-Control", "no-cache")
+	upstreamReq.Header.Set("Connection", "keep-alive")
+
+	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+	c.Status(http.StatusOK)
+
+	streamingTransformers := getStreamingTransformers(route.RespTransformers)
+
+	scanner := bufio.NewReader(upstreamResp.Body)
+	for {
+		line, err := scanner.ReadString('\n')
+		if err != nil {
+			break
+		}
+
+		line = strings.TrimSpace(line)
+
+		if line == "" {
+			continue
+		}
+
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+
+		if line == "data: [DONE]" {
+			for _, st := range streamingTransformers {
+				_, newChunk, _ := st.TransformStream([]byte(line))
+				if len(newChunk) > 0 {
+					c.Writer.Write(newChunk)
+				}
+			}
+			c.Writer.Write([]byte("data: [DONE]\n\n"))
+			c.Writer.Flush()
+			break
+		}
+
+		if !strings.HasPrefix(line, "data: ") {
+			c.Writer.Write([]byte(line + "\n"))
+			c.Writer.Flush()
+			continue
+		}
+
+		jsonStr := line[len("data: "):]
+
+		for _, st := range streamingTransformers {
+			modified, newChunk, keepChunk := st.TransformStream([]byte(jsonStr))
+			if modified && len(newChunk) > 0 {
+				c.Writer.Write(newChunk)
+				c.Writer.Flush()
+				if !keepChunk {
+					continue
+				}
+			}
+			if !modified || keepChunk {
+				c.Writer.Write([]byte(line + "\n\n"))
+				c.Writer.Flush()
+			}
+		}
+	}
+
+	latencyMs := time.Since(startTime).Milliseconds()
+	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, 0, 0)
+}

@@ -1,0 +1,38 @@
+{
+  "port": 8080,
+  "log_level": "info",
+  "timeout": "600s",
+  "transformers": {
+    "kimi-tool-calls": {
+      "enabled": true
+    },
+    "anthropic-to-openai": {
+      "enabled": true
+    }
+  },
+  "upstreams": [
+    {
+      "name": "chutes",
+      "provider": "chutes.ai",
+      "endpoint": "https://llm.chutes.ai/v1",
+      "api_key": "API_KEY",
+      "models": [
+        {
+          "pattern": "moonshotai/Kimi-K2.5*",
+          "transformers": ["kimi-tool-calls"],
+          "request_transformers": ["anthropic-to-openai"]
+        },
+        {
+          "pattern": "moonshotai/*",
+          "transformers": [],
+          "request_transformers": []
+        },
+        {
+          "pattern": "qwen/*",
+          "transformers": [],
+          "request_transformers": []
+        }
+      ]
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import (
 
 	"ai-proxy/cmd/config"
 	"ai-proxy/cmd/server"
+	"ai-proxy/internal/logger"
 )
 
 func main() {
@@ -26,6 +27,9 @@ func main() {
 	rootCmd.AddCommand(config.ConfigCmd)
 
 	viper.BindPFlags(rootCmd.PersistentFlags())
+
+	// Initialize logger before executing commands
+	logger.Init(viper.GetString("log-level"))
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatal(err)

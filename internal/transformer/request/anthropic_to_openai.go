@@ -435,6 +435,14 @@ func transformTools(tools []interface{}) []interface{} {
 			continue
 		}
 
+		// Check if already in OpenAI format (has nested "function" object)
+		if _, hasFunction := tool["function"]; hasFunction {
+			// Already OpenAI format, pass through unchanged
+			result = append(result, tool)
+			continue
+		}
+
+		// Convert from Anthropic format to OpenAI format
 		newTool := map[string]interface{}{
 			"type": "function",
 		}

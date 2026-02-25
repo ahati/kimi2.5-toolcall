@@ -61,10 +61,25 @@ func LoadConfig(cmd *cobra.Command) (*Config, error) {
 
 		searchPaths := []string{}
 
+		// XDG config directories (highest priority)
+		if xdgConfig := os.Getenv("XDG_CONFIG_DIR"); xdgConfig != "" {
+			searchPaths = append(searchPaths, filepath.Join(xdgConfig, "ai-proxy", "ai-proxy-config.json"))
+		}
+		homeConfig, _ := os.UserConfigDir()
+		if homeConfig != "" {
+			searchPaths = append(searchPaths, filepath.Join(homeConfig, "ai-proxy", "ai-proxy-config.json"))
+		}
+
+		// XDG data directories (fallback for backwards compatibility)
 		if xdgData := os.Getenv("XDG_DATA_DIR"); xdgData != "" {
 			searchPaths = append(searchPaths, filepath.Join(xdgData, "ai-proxy-config.json"))
 		}
+		homeData, _ := os.UserHomeDir()
+		if homeData != "" {
+			searchPaths = append(searchPaths, filepath.Join(homeData, ".local", "share", "ai-proxy-config.json"))
+		}
 
+		// Current working directory (lowest priority)
 		searchPaths = append(searchPaths, "./ai-proxy-config.json")
 
 		for _, p := range searchPaths {

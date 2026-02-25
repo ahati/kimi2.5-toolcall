@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"ai-proxy/internal/provider"
+
 	"github.com/spf13/cobra"
 )
 
@@ -117,6 +119,38 @@ var ConfigCmd = &cobra.Command{
 		models, err := fetcher.FetchModels()
 		if err != nil {
 			return fmt.Errorf("failed to fetch models: %w", err)
+		}
+
+		// Inject hardcoded models from providers without /v1/models endpoint
+		providerRegistry := provider.NewRegistry()
+		providerRegistry.Register(provider.NewMinimaxProvider())
+		for _, hardcodedModel := range providerRegistry.GetAllModels() {
+			models = append(models, ModelInfo{
+				ID:                  hardcodedModel.ID,
+				ContextLength:       hardcodedModel.ContextLength,
+				MaxOutputLength:     hardcodedModel.MaxOutputLength,
+				InputModalities:     hardcodedModel.InputModalities,
+				OutputModalities:    hardcodedModel.OutputModalities,
+				ConfidentialCompute: hardcodedModel.ConfidentialCompute,
+				Pricing: Pricing{
+					Prompt:         hardcodedModel.Pricing.Prompt,
+					Completion:     hardcodedModel.Pricing.Completion,
+					InputCacheRead: hardcodedModel.Pricing.InputCacheRead,
+				},
+				SupportedFeatures: func() []string {
+					features := []string{}
+					if hardcodedModel.Features.Reasoning {
+						features = append(features, "reasoning")
+					}
+					if hardcodedModel.Features.Temperature {
+						features = append(features, "temperature")
+					}
+					if hardcodedModel.Features.ToolCall {
+						features = append(features, "tools")
+					}
+					return features
+				}(),
+			})
 		}
 
 		teeModels := make(map[string]interface{})

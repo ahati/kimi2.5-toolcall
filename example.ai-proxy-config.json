@@ -43,6 +43,19 @@
           "request_transformers": []
         }
       ]
+    },
+    {
+      "name": "minimax",
+      "provider": "minimax.io",
+      "endpoint": "https://api.minimax.io/v1",
+      "api_key": "ENV:MINIMAX_API_KEY",
+      "models": [
+        {
+          "pattern": "MiniMax-M2.5",
+          "transformers": [],
+          "request_transformers": []
+        }
+      ]
     }
   ]
 }

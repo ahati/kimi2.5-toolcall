@@ -2,7 +2,9 @@ package handler
 
 import (
 	"ai-proxy/internal/config"
+	"ai-proxy/internal/logger"
 	"ai-proxy/internal/metrics"
+	"ai-proxy/internal/provider"
 	"ai-proxy/internal/proxy"
 	"ai-proxy/internal/transformer"
 	"bufio"
@@ -17,35 +19,59 @@ import (
 )
 
 type Handler struct {
-	proxy   *proxy.Proxy
-	config  *config.Config
-	metrics *metrics.Metrics
+	proxy            *proxy.Proxy
+	config           *config.Config
+	metrics          *metrics.Metrics
+	providerRegistry *provider.Registry
 }
 
-func New(p *proxy.Proxy, cfg *config.Config, m *metrics.Metrics) *Handler {
+func New(p *proxy.Proxy, cfg *config.Config, m *metrics.Metrics, pr *provider.Registry) *Handler {
 	return &Handler{
-		proxy:   p,
-		config:  cfg,
-		metrics: m,
+		proxy:            p,
+		config:           cfg,
+		metrics:          m,
+		providerRegistry: pr,
 	}
+}
+
+func logDebugf(requestID int64, component, format string, args ...interface{}) {
+	logger.Debugf("[REQ-%d][%s] "+format, append([]interface{}{requestID, component}, args...)...)
+}
+
+func logInfof(requestID int64, component, format string, args ...interface{}) {
+	logger.Infof("[REQ-%d][%s] "+format, append([]interface{}{requestID, component}, args...)...)
+}
+
+func logErrorf(requestID int64, component, format string, args ...interface{}) {
+	logger.Errorf("[REQ-%d][%s] "+format, append([]interface{}{requestID, component}, args...)...)
 }
 
 func (h *Handler) ChatCompletions(c *gin.Context) {
+	startTime := time.Now()
+	requestID := time.Now().UnixNano()
+	logInfof(requestID, "HTTP", "=== STARTING REQUEST ===")
+
 	bodyBytes, err := io.ReadAll(c.Request.Body)
 	if err != nil {
+		logErrorf(requestID, "HTTP", "Failed to read request body: %v", err)
 		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Failed to read request body"))
 		return
 	}
+	logDebugf(requestID, "HTTP", "Read request body in %v", time.Since(startTime))
+
 	defer c.Request.Body.Close()
 
 	var req map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &req); err != nil {
+		logErrorf(requestID, "HTTP", "Failed to parse JSON: %v", err)
 		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "Invalid JSON"))
 		return
 	}
+	logDebugf(requestID, "HTTP", "Parsed JSON in %v", time.Since(startTime))
 
 	model, _ := req["model"].(string)
 	if model == "" {
+		logErrorf(requestID, "HTTP", "Missing model parameter")
 		c.JSON(http.StatusBadRequest, NewErrorResponse("invalid_request_error", "model is required"))
 		return
 	}
@@ -53,19 +79,25 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	route, err := h.proxy.Route(model)
 	if err != nil {
 		if pe, ok := err.(*proxy.ProxyError); ok {
+			logErrorf(requestID, "HTTP", "Route error: %v", err)
 			c.JSON(http.StatusBadRequest, NewErrorResponse(pe.Code, pe.Message))
 			return
 		}
+		logErrorf(requestID, "HTTP", "Route error: %v", err)
 		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", err.Error()))
 		return
 	}
+	logDebugf(requestID, "HTTP", "Routed to %s in %v", route.Upstream.Provider, time.Since(startTime))
 
-	for _, t := range route.ReqTransformers {
+	for i, t := range route.ReqTransformers {
+		t0 := time.Now()
 		bodyBytes, err = t.TransformRequest(bodyBytes, route.StrippedModel)
 		if err != nil {
+			logErrorf(requestID, "HTTP", "Request transformer %d failed: %v", i, err)
 			c.JSON(http.StatusInternalServerError, NewErrorResponse("transform_error", "Request transformation failed: "+err.Error()))
 			return
 		}
+		logDebugf(requestID, "HTTP", "Request transformer %d (%s) took %v", i, t.Name(), time.Since(t0))
 	}
 
 	var transformedReq map[string]interface{}
@@ -76,9 +108,11 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	bodyBytes, err = json.Marshal(transformedReq)
 	if err != nil {
+		logErrorf(requestID, "HTTP", "Failed to serialize request: %v", err)
 		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to serialize request"))
 		return
 	}
+	logDebugf(requestID, "HTTP", "Serialized request in %v", time.Since(startTime))
 
 	inputTokens := h.countTokens(transformedReq)
 
@@ -99,22 +133,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	upstreamReq.Header.Set("Authorization", "Bearer "+route.Upstream.APIKey)
 
 	// Start timing
-	startTime := time.Now()
-
-	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
-	if err != nil {
-		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
-		return
-	}
-	defer upstreamResp.Body.Close()
-
-	respBody, _ := io.ReadAll(upstreamResp.Body)
-
-	// Extract usage from original response before transformation
-	usageInputTokens, usageOutputTokens := h.extractUsageFromResponse(respBody)
-
-	// Calculate latency
-	latencyMs := time.Since(startTime).Milliseconds()
+	reqStartTime := time.Now()
 
 	isStreaming := false
 	if s, ok := req["stream"].(bool); ok && s {
@@ -123,22 +142,49 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	hasStreamingTransformer := hasStreamingTransformer(route.RespTransformers)
 
+	// For streaming with transformers, forward directly without buffering
 	if isStreaming && hasStreamingTransformer {
-		h.handleStreaming(c, upstreamURL, bodyBytes, route, startTime, inputTokens)
+		logDebugf(requestID, "HTTP", "Streaming request detected, using direct streaming mode")
+		h.handleStreaming(c, upstreamURL, bodyBytes, route, reqStartTime, inputTokens)
 		return
 	}
 
-	for _, t := range route.RespTransformers {
+	logDebugf(requestID, "HTTP", "Making upstream request to %s", upstreamURL)
+	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
+		return
+	}
+	defer upstreamResp.Body.Close()
+
+	logDebugf(requestID, "HTTP", "Reading response body...")
+	respBody, _ := io.ReadAll(upstreamResp.Body)
+	logDebugf(requestID, "HTTP", "Response body read (%d bytes) in %v", len(respBody), time.Since(reqStartTime))
+
+	// Extract usage from original response before transformation
+	usageInputTokens, usageOutputTokens := h.extractUsageFromResponse(respBody)
+
+	// Calculate latency
+	latencyMs := time.Since(reqStartTime).Milliseconds()
+	logDebugf(requestID, "HTTP", "Upstream request completed in %vms", latencyMs)
+
+	logDebugf(requestID, "HTTP", "Applying %d response transformers", len(route.RespTransformers))
+	for i, t := range route.RespTransformers {
+		t0 := time.Now()
 		respBody, err = t.TransformResponse(respBody, isStreaming)
 		if err != nil {
-			// Log but continue
+			logErrorf(requestID, "HTTP", "Transformer %d (%s) error: %v", i, t.Name(), err)
+		} else {
+			logDebugf(requestID, "HTTP", "Transformer %d (%s) completed in %v", i, t.Name(), time.Since(t0))
 		}
 	}
 
 	// Use API usage data if available, otherwise fall back to estimation
 	outputTokens := usageOutputTokens
 	if outputTokens == 0 {
+		t0 := time.Now()
 		outputTokens = h.countResponseTokens(respBody)
+		logDebugf(requestID, "HTTP", "Token counting took %v", time.Since(t0))
 	}
 
 	// Use API usage data for input tokens if available
@@ -149,6 +195,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	// Record metrics
 	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, inputTokens, outputTokens)
 
+	// Send response
 	for k, v := range upstreamResp.Header {
 		if strings.ToLower(k) == "transfer-encoding" {
 			continue
@@ -157,6 +204,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	}
 
 	c.Data(upstreamResp.StatusCode, upstreamResp.Header.Get("Content-Type"), respBody)
+	logInfof(requestID, "HTTP", "=== REQUEST COMPLETE (total: %v) ===", time.Since(reqStartTime))
 }
 
 func (h *Handler) AnthropicMessages(c *gin.Context) {
@@ -255,6 +303,41 @@ func (h *Handler) AnthropicMessages(c *gin.Context) {
 
 func (h *Handler) ListModels(c *gin.Context) {
 	models := []map[string]interface{}{}
+
+	// Add hardcoded models from providers without /v1/models endpoint
+	if h.providerRegistry != nil {
+		for _, model := range h.providerRegistry.GetAllModels() {
+			models = append(models, map[string]interface{}{
+				"id":                   model.ID,
+				"object":               "model",
+				"created":              1700000000,
+				"owned_by":             model.ID[:strings.Index(model.ID, "/")],
+				"context_length":       model.ContextLength,
+				"max_output_length":    model.MaxOutputLength,
+				"input_modalities":     model.InputModalities,
+				"output_modalities":    model.OutputModalities,
+				"confidential_compute": model.ConfidentialCompute,
+				"pricing": map[string]interface{}{
+					"prompt":           model.Pricing.Prompt,
+					"completion":       model.Pricing.Completion,
+					"input_cache_read": model.Pricing.InputCacheRead,
+				},
+				"supported_features": func() []string {
+					features := []string{}
+					if model.Features.Reasoning {
+						features = append(features, "reasoning")
+					}
+					if model.Features.Temperature {
+						features = append(features, "temperature")
+					}
+					if model.Features.ToolCall {
+						features = append(features, "tools")
+					}
+					return features
+				}(),
+			})
+		}
+	}
 
 	for _, upstream := range h.config.Upstreams {
 		upstreamURL := upstream.Endpoint + "/models"
@@ -498,8 +581,11 @@ func getStreamingTransformers(transformers []transformer.ResponseTransformer) []
 }
 
 func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes []byte, route *proxy.RouteResult, startTime time.Time, inputTokens int64) {
+	logInfof(0, "HTTP", "=== STARTING STREAMING REQUEST ===")
+	logDebugf(0, "HTTP", "Creating upstream request to %s", upstreamURL)
 	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
 	if err != nil {
+		logErrorf(0, "HTTP", "Failed to create upstream request: %v", err)
 		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to create upstream request"))
 		return
 	}
@@ -516,12 +602,18 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 	upstreamReq.Header.Set("Cache-Control", "no-cache")
 	upstreamReq.Header.Set("Connection", "keep-alive")
 
+	logDebugf(0, "HTTP", "Sending upstream request...")
+	reqStart := time.Now()
 	upstreamResp, err := h.proxy.HTTPClient().Do(upstreamReq)
+	logDebugf(0, "HTTP", "Upstream request completed in %v", time.Since(reqStart))
 	if err != nil {
+		logErrorf(0, "HTTP", "Upstream request failed: %v", err)
 		c.JSON(http.StatusBadGateway, NewErrorResponse("upstream_error", "Upstream request failed: "+err.Error()))
 		return
 	}
 	defer upstreamResp.Body.Close()
+
+	logDebugf(0, "HTTP", "Starting to read streaming response...")
 
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
@@ -530,14 +622,25 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 	c.Status(http.StatusOK)
 
 	streamingTransformers := getStreamingTransformers(route.RespTransformers)
+	logDebugf(0, "HTTP", "Found %d streaming transformers", len(streamingTransformers))
 
-	scanner := bufio.NewReader(upstreamResp.Body)
+	scanner := bufio.NewReaderSize(upstreamResp.Body, 64*1024) // 64KB buffer for better throughput
+	chunkCount := 0
 	for {
+		chunkStart := time.Now()
 		line, err := scanner.ReadString('\n')
+		readTime := time.Since(chunkStart)
+
+		if readTime > 100*time.Millisecond {
+			logDebugf(0, "HTTP", "Slow read: %v for line %d", readTime, chunkCount)
+		}
+
 		if err != nil {
+			logDebugf(0, "HTTP", "Stream ended after %d chunks", chunkCount)
 			break
 		}
 
+		chunkCount++
 		line = strings.TrimSpace(line)
 
 		if line == "" {
@@ -549,6 +652,7 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 		}
 
 		if line == "data: [DONE]" {
+			logDebugf(0, "HTTP", "Received [DONE], processing final chunks")
 			for _, st := range streamingTransformers {
 				_, newChunk, _ := st.TransformStream([]byte(line))
 				if len(newChunk) > 0 {
@@ -557,6 +661,7 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 			}
 			c.Writer.Write([]byte("data: [DONE]\n\n"))
 			c.Writer.Flush()
+			logInfof(0, "HTTP", "=== STREAMING REQUEST COMPLETE (total chunks: %d) ===", chunkCount)
 			break
 		}
 
@@ -567,9 +672,17 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 		}
 
 		jsonStr := line[len("data: "):]
+		chunkSize := len(jsonStr)
 
 		for _, st := range streamingTransformers {
+			t0 := time.Now()
 			modified, newChunk, keepChunk := st.TransformStream([]byte(jsonStr))
+			transformTime := time.Since(t0)
+
+			if transformTime > 50*time.Millisecond {
+				logger.Warnf("[REQ-%d][%s] Slow transform (%s): %v for chunk %d (size: %d)", 0, "HTTP", st.Name(), transformTime, chunkCount, chunkSize)
+			}
+
 			if modified && len(newChunk) > 0 {
 				c.Writer.Write(newChunk)
 				c.Writer.Flush()
@@ -586,6 +699,7 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 
 	// Drain any remaining bytes from backend stream to prevent backend from seeing connection reset
 	// This ensures the backend doesn't see a connection reset/cancellation
+	logDebugf(0, "HTTP", "Draining remaining stream bytes...")
 	io.Copy(io.Discard, upstreamResp.Body)
 
 	outputTokens := int64(0)
@@ -599,5 +713,7 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 	}
 
 	latencyMs := time.Since(startTime).Milliseconds()
+	logDebugf(0, "HTTP", "Recording metrics: latency=%vms, inputTokens=%d, outputTokens=%d", latencyMs, inputTokens, outputTokens)
 	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, inputTokens, outputTokens)
+	logger.Infof("[REQ-%d][%s] === STREAMING REQUEST COMPLETE ===", 0, "HTTP")
 }

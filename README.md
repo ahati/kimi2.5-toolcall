@@ -50,15 +50,27 @@ go install
           "pattern": "*"
         }
       ]
+    },
+    {
+      "name": "minimax",
+      "provider": "minimax.io",
+      "endpoint": "https://api.minimax.io/v1",
+      "api_key": "ENV:MINIMAX_API_KEY",
+      "models": [
+        {
+          "pattern": "MiniMax-M2.5"
+        }
+      ]
     }
   ]
 }
 ```
 
-2. Set your API key environment variable:
+2. Set your API key environment variables:
 
 ```bash
 export CHUTES_API_KEY="your-api-key-here"
+export MINIMAX_API_KEY="your-minimax-key-here"
 ```
 
 3. Start the proxy:

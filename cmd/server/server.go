@@ -3,10 +3,11 @@ package server
 import (
 	ai_proxy_config "ai-proxy/internal/config"
 	"ai-proxy/internal/handler"
+	"ai-proxy/internal/logger"
 	"ai-proxy/internal/metrics"
+	"ai-proxy/internal/provider"
 	"ai-proxy/internal/proxy"
 	"fmt"
-	"log"
 
 	"github.com/gin-gonic/gin"
 	"github.com/spf13/cobra"
@@ -21,9 +22,17 @@ var ServeCmd = &cobra.Command{
 			return fmt.Errorf("failed to load config: %w", err)
 		}
 
+		// Update logger level from config
+		logger.SetLevel(cfg.LogLevel)
+
 		m := metrics.New()
 		p := proxy.New(cfg)
-		h := handler.New(p, cfg, m)
+
+		// Initialize provider registry and register hardcoded providers
+		providerRegistry := provider.NewRegistry()
+		providerRegistry.Register(provider.NewMinimaxProvider())
+
+		h := handler.New(p, cfg, m, providerRegistry)
 
 		r := gin.Default()
 
@@ -34,7 +43,7 @@ var ServeCmd = &cobra.Command{
 		r.GET("/metrics", h.MetricsHandler)
 
 		addr := fmt.Sprintf(":%d", cfg.Port)
-		log.Printf("Starting AI Proxy on %s", addr)
+		logger.Infof("Starting AI Proxy on %s", addr)
 		return r.Run(addr)
 	},
 }

@@ -157,8 +157,7 @@ func (p *Proxy) Route(model string) (*RouteResult, error) {
 │   ├── handler/              # HTTP handlers
 │   ├── metrics/              # Metrics collection
 │   ├── proxy/                # Proxy routing logic
-│   ├── transformer/          # Request/response transformers
-│   └── upstream/             # Upstream provider clients
+│   └── transformer/          # Request/response transformers
 └── docs/                     # Documentation
 ```
 

@@ -68,16 +68,19 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 	}
 
-	req["model"] = route.StrippedModel
+	var transformedReq map[string]interface{}
+	if err := json.Unmarshal(bodyBytes, &transformedReq); err != nil {
+		transformedReq = req
+	}
+	transformedReq["model"] = route.StrippedModel
 
-	bodyBytes, err = json.Marshal(req)
+	bodyBytes, err = json.Marshal(transformedReq)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to serialize request"))
 		return
 	}
 
-	// Count input tokens from request
-	inputTokens := h.countTokens(req)
+	inputTokens := h.countTokens(transformedReq)
 
 	upstreamURL := route.Upstream.Endpoint + "/chat/completions"
 	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
@@ -107,6 +110,9 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 
 	respBody, _ := io.ReadAll(upstreamResp.Body)
 
+	// Extract usage from original response before transformation
+	usageInputTokens, usageOutputTokens := h.extractUsageFromResponse(respBody)
+
 	// Calculate latency
 	latencyMs := time.Since(startTime).Milliseconds()
 
@@ -118,7 +124,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 	hasStreamingTransformer := hasStreamingTransformer(route.RespTransformers)
 
 	if isStreaming && hasStreamingTransformer {
-		h.handleStreaming(c, upstreamURL, bodyBytes, route, startTime)
+		h.handleStreaming(c, upstreamURL, bodyBytes, route, startTime, inputTokens)
 		return
 	}
 
@@ -129,8 +135,16 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		}
 	}
 
-	// Count output tokens from response
-	outputTokens := h.countResponseTokens(respBody)
+	// Use API usage data if available, otherwise fall back to estimation
+	outputTokens := usageOutputTokens
+	if outputTokens == 0 {
+		outputTokens = h.countResponseTokens(respBody)
+	}
+
+	// Use API usage data for input tokens if available
+	if usageInputTokens > 0 {
+		inputTokens = usageInputTokens
+	}
 
 	// Record metrics
 	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, inputTokens, outputTokens)
@@ -331,8 +345,31 @@ func (h *Handler) countTokens(req map[string]interface{}) int64 {
 	if messages, ok := req["messages"].([]interface{}); ok {
 		for _, msg := range messages {
 			if msgMap, ok := msg.(map[string]interface{}); ok {
-				if content, ok := msgMap["content"].(string); ok {
-					count += int64(len(content)) / 4
+				count += h.countMessageTokens(msgMap)
+			}
+		}
+	}
+
+	return count
+}
+
+func (h *Handler) countMessageTokens(msgMap map[string]interface{}) int64 {
+	var count int64
+
+	if content := msgMap["content"]; content != nil {
+		count += h.countContentTokens(content)
+	}
+
+	if toolCalls, ok := msgMap["tool_calls"].([]interface{}); ok {
+		for _, tc := range toolCalls {
+			if tcMap, ok := tc.(map[string]interface{}); ok {
+				if fn, ok := tcMap["function"].(map[string]interface{}); ok {
+					if name, ok := fn["name"].(string); ok {
+						count += int64(len(name)) / 4
+					}
+					if args, ok := fn["arguments"].(string); ok {
+						count += int64(len(args)) / 4
+					}
 				}
 			}
 		}
@@ -341,7 +378,42 @@ func (h *Handler) countTokens(req map[string]interface{}) int64 {
 	return count
 }
 
+func (h *Handler) countContentTokens(content interface{}) int64 {
+	switch c := content.(type) {
+	case string:
+		return int64(len(c)) / 4
+	case []interface{}:
+		var count int64
+		for _, block := range c {
+			if blockMap, ok := block.(map[string]interface{}); ok {
+				if blockType, ok := blockMap["type"].(string); ok {
+					switch blockType {
+					case "text":
+						if text, ok := blockMap["text"].(string); ok {
+							count += int64(len(text)) / 4
+						}
+					case "thinking":
+						if thinking, ok := blockMap["thinking"].(string); ok {
+							count += int64(len(thinking)) / 4
+						}
+					case "image_url":
+						if imgURL, ok := blockMap["image_url"].(map[string]interface{}); ok {
+							if url, ok := imgURL["url"].(string); ok {
+								count += int64(len(url)) / 4
+							}
+						}
+					}
+				}
+			}
+		}
+		return count
+	default:
+		return 0
+	}
+}
+
 func (h *Handler) countResponseTokens(respBody []byte) int64 {
+
 	var count int64
 
 	var resp map[string]interface{}
@@ -365,6 +437,36 @@ func (h *Handler) countResponseTokens(respBody []byte) int64 {
 	}
 
 	return count
+}
+
+func (h *Handler) extractUsageFromResponse(respBody []byte) (inputTokens, outputTokens int64) {
+	var resp map[string]interface{}
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return 0, 0
+	}
+
+	usage, ok := resp["usage"].(map[string]interface{})
+	if !ok {
+		return 0, 0
+	}
+
+	if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
+		inputTokens = int64(promptTokens)
+	} else if totalTokens, ok := usage["total_tokens"].(float64); ok {
+		if completionTokens, ok := usage["completion_tokens"].(float64); ok {
+			inputTokens = int64(totalTokens) - int64(completionTokens)
+		}
+	}
+
+	if completionTokens, ok := usage["completion_tokens"].(float64); ok {
+		outputTokens = int64(completionTokens)
+	} else if totalTokens, ok := usage["total_tokens"].(float64); ok {
+		if promptTokens, ok := usage["prompt_tokens"].(float64); ok {
+			outputTokens = int64(totalTokens) - int64(promptTokens)
+		}
+	}
+
+	return inputTokens, outputTokens
 }
 
 func (h *Handler) MetricsHandler(c *gin.Context) {
@@ -395,7 +497,7 @@ func getStreamingTransformers(transformers []transformer.ResponseTransformer) []
 	return result
 }
 
-func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes []byte, route *proxy.RouteResult, startTime time.Time) {
+func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes []byte, route *proxy.RouteResult, startTime time.Time, inputTokens int64) {
 	upstreamReq, err := http.NewRequest("POST", upstreamURL, bytes.NewReader(bodyBytes))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, NewErrorResponse("internal_error", "Failed to create upstream request"))
@@ -482,6 +584,20 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 		}
 	}
 
+	// Drain any remaining bytes from backend stream to prevent backend from seeing connection reset
+	// This ensures the backend doesn't see a connection reset/cancellation
+	io.Copy(io.Discard, upstreamResp.Body)
+
+	outputTokens := int64(0)
+	for _, st := range streamingTransformers {
+		if tracker, ok := st.(transformer.TokenUsageTracker); ok {
+			_, outTokens := tracker.GetTokenUsage()
+			if outTokens > 0 {
+				outputTokens = outTokens
+			}
+		}
+	}
+
 	latencyMs := time.Since(startTime).Milliseconds()
-	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, 0, 0)
+	h.metrics.RecordRequest(route.Upstream.Provider, route.StrippedModel, latencyMs, inputTokens, outputTokens)
 }

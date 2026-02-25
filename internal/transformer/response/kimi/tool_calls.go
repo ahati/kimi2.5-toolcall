@@ -193,6 +193,8 @@ type KimiToolCallsTransformer struct {
 	emittedFinish    bool
 	chunkTemplate    map[string]interface{}
 	lastChoiceIndex  int
+	inputTokens      int64
+	outputTokens     int64
 }
 
 func NewKimiToolCallsTransformer() *KimiToolCallsTransformer {
@@ -211,6 +213,12 @@ func (t *KimiToolCallsTransformer) Reset() {
 	t.emittedFinish = false
 	t.chunkTemplate = nil
 	t.lastChoiceIndex = 0
+	t.inputTokens = 0
+	t.outputTokens = 0
+}
+
+func (t *KimiToolCallsTransformer) GetTokenUsage() (inputTokens, outputTokens int64) {
+	return t.inputTokens, t.outputTokens
 }
 
 func (t *KimiToolCallsTransformer) Name() string {
@@ -228,6 +236,19 @@ func (t *KimiToolCallsTransformer) transformNonStreaming(body []byte) ([]byte, e
 	var resp map[string]interface{}
 	if err := json.Unmarshal(body, &resp); err != nil {
 		return body, nil
+	}
+
+	if usage, ok := resp["usage"].(map[string]interface{}); ok {
+		if pt, ok := usage["prompt_tokens"].(float64); ok {
+			t.inputTokens = int64(pt)
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok {
+			t.outputTokens = int64(ct)
+		} else if tt, ok := usage["total_tokens"].(float64); ok {
+			if t.inputTokens > 0 {
+				t.outputTokens = int64(tt) - t.inputTokens
+			}
+		}
 	}
 
 	choices, ok := resp["choices"].([]interface{})
@@ -383,6 +404,19 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 		return false, chunk, true
 	}
 
+	if usage, ok := chunkData["usage"].(map[string]interface{}); ok {
+		if pt, ok := usage["prompt_tokens"].(float64); ok {
+			t.inputTokens = int64(pt)
+		}
+		if ct, ok := usage["completion_tokens"].(float64); ok {
+			t.outputTokens = int64(ct)
+		} else if tt, ok := usage["total_tokens"].(float64); ok {
+			if t.inputTokens > 0 {
+				t.outputTokens = int64(tt) - t.inputTokens
+			}
+		}
+	}
+
 	choices, ok := chunkData["choices"].([]interface{})
 	if !ok || len(choices) == 0 {
 		return false, chunk, true
@@ -413,6 +447,7 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 	modified = false
 
 	if rc, ok := delta["reasoning_content"].(string); ok {
+		t.outputTokens += int64(len(rc)) / 4
 		if containsToolTokens(rc) || t.accumulator.inSection || t.accumulator.inCall {
 			clean := t.accumulator.feed(rc)
 			if clean != "" {
@@ -425,6 +460,7 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 	}
 
 	if content, ok := delta["content"].(string); ok {
+		t.outputTokens += int64(len(content)) / 4
 		if containsToolTokens(content) || t.accumulator.inSection || t.accumulator.inCall {
 			clean := t.accumulator.feed(content)
 			if clean != "" {

@@ -64,6 +64,20 @@ func (p *Proxy) Route(model string) (*RouteResult, error) {
 	if matchedUpstream == nil {
 		for i := range p.config.Upstreams {
 			for _, mc := range p.config.Upstreams[i].Models {
+				if matchModelPattern(remainingModel, mc.Pattern) {
+					matchedUpstream = &p.config.Upstreams[i]
+					break
+				}
+			}
+			if matchedUpstream != nil {
+				break
+			}
+		}
+	}
+
+	if matchedUpstream == nil {
+		for i := range p.config.Upstreams {
+			for _, mc := range p.config.Upstreams[i].Models {
 				if mc.Pattern == "*" {
 					matchedUpstream = &p.config.Upstreams[i]
 					break

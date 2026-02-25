@@ -17,6 +17,10 @@ type StreamingTransformer interface {
 	TransformStream(chunk []byte) (modified bool, newChunk []byte, keepChunk bool)
 }
 
+type TokenUsageTracker interface {
+	GetTokenUsage() (inputTokens, outputTokens int64)
+}
+
 type Registry struct {
 	requestTransformers  map[string]RequestTransformer
 	responseTransformers map[string]ResponseTransformer

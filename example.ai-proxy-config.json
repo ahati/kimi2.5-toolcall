@@ -31,6 +31,16 @@
           "pattern": "qwen/*",
           "transformers": [],
           "request_transformers": []
+        },
+        {
+          "pattern": "MiniMaxAI/*",
+          "transformers": [],
+          "request_transformers": []
+        },
+        {
+          "pattern": "zai-org/*",
+          "transformers": [],
+          "request_transformers": []
         }
       ]
     }

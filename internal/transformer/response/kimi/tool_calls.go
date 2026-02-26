@@ -45,33 +45,52 @@ type ToolCallAccumulator struct {
 }
 
 func (a *ToolCallAccumulator) feed(text string) string {
+	logger.Debugf("[kimi-tool-calls] feed() called with %d chars: %q", len(text), text[:min(len(text), 100)])
 	a.buffer.WriteString(text)
-	return a.consume()
+	result := a.consume()
+	logger.Debugf("[kimi-tool-calls] feed() returning %d chars clean text", len(result))
+	return result
 }
 
 func (a *ToolCallAccumulator) consume() string {
 	var clean strings.Builder
 	bufStr := a.buffer.String()
+	initialLen := len(bufStr)
+
+	logger.Debugf("[kimi-tool-calls] consume() START: buffer_len=%d, %s", initialLen, a.dumpState())
 
 	for len(bufStr) > 0 {
 		if isPartialTokenPrefix(bufStr) {
+			logger.Debugf("[kimi-tool-calls] Breaking on partial token: remaining=%d chars", len(bufStr))
 			break
 		}
 
 		matched := false
 
 		if strings.HasPrefix(bufStr, TOK_SECTION_BEGIN) {
+			logger.Debugf("[kimi-tool-calls] STATE TRANSITION: entering section")
 			a.inSection = true
 			bufStr = bufStr[len(TOK_SECTION_BEGIN):]
 			logger.Debugf("[kimi-tool-calls] Tool call section STARTED — intercepting raw tool tokens")
 			matched = true
 		} else if strings.HasPrefix(bufStr, TOK_SECTION_END) {
+			logger.Infof("[kimi-tool-calls] SECTION END detected - state before: inCall=%v, inArgs=%v, idBuf=%d chars, argsBuf=%d chars",
+				a.inCall, a.inArgs, a.currentIDBuf.Len(), a.currentArgsBuf.Len())
+			if a.inCall {
+				logger.Infof("[kimi-tool-calls] AUTO-FINALIZING call at section end (id=%q)", a.currentIDBuf.String())
+				a.finalizeCall()
+			}
 			a.inSection = false
 			a.finished = true
 			bufStr = bufStr[len(TOK_SECTION_END):]
-			logger.Debugf("[kimi-tool-calls] Tool call section ENDED — %d tool call(s) parsed", len(a.toolCalls))
+			logger.Infof("[kimi-tool-calls] Tool call section ENDED — %d tool call(s) parsed", len(a.toolCalls))
 			matched = true
 		} else if strings.HasPrefix(bufStr, TOK_CALL_BEGIN) {
+			if a.inCall {
+				logger.Debugf("[kimi-tool-calls] STATE TRANSITION: new call while inCall=true, finalizing previous")
+				a.finalizeCall()
+			}
+			logger.Debugf("[kimi-tool-calls] STATE TRANSITION: entering call")
 			a.inCall = true
 			a.inArgs = false
 			a.currentIDBuf.Reset()
@@ -80,10 +99,12 @@ func (a *ToolCallAccumulator) consume() string {
 			logger.Debugf("[kimi-tool-calls] Parsing new tool call …")
 			matched = true
 		} else if strings.HasPrefix(bufStr, TOK_ARG_BEGIN) {
+			logger.Debugf("[kimi-tool-calls] STATE TRANSITION: entering args (idBuf=%d chars)", a.currentIDBuf.Len())
 			a.inArgs = true
 			bufStr = bufStr[len(TOK_ARG_BEGIN):]
 			matched = true
 		} else if strings.HasPrefix(bufStr, TOK_CALL_END) {
+			logger.Debugf("[kimi-tool-calls] STATE TRANSITION: call end")
 			a.finalizeCall()
 			bufStr = bufStr[len(TOK_CALL_END):]
 			matched = true
@@ -94,13 +115,17 @@ func (a *ToolCallAccumulator) consume() string {
 			bufStr = bufStr[1:]
 			if a.inCall {
 				if a.inArgs {
+					logger.Debugf("[kimi-tool-calls] CAPTURING args char: %q (argsBuf now %d chars)", string(ch), a.currentArgsBuf.Len()+1)
 					a.currentArgsBuf.WriteByte(ch)
 				} else {
+					logger.Debugf("[kimi-tool-calls] CAPTURING id char: %q (idBuf now %d chars)", string(ch), a.currentIDBuf.Len()+1)
 					a.currentIDBuf.WriteByte(ch)
 				}
 			} else if a.inSection {
+				logger.Debugf("[kimi-tool-calls] SKIPPING whitespace in section: %q", string(ch))
 				// skip whitespace/noise between calls in section
 			} else {
+				logger.Debugf("[kimi-tool-calls] PASSING THROUGH to clean: %q", string(ch))
 				clean.WriteByte(ch)
 			}
 		}
@@ -110,6 +135,9 @@ func (a *ToolCallAccumulator) consume() string {
 	a.buffer.Reset()
 	a.buffer.WriteString(bufStr)
 
+	logger.Debugf("[kimi-tool-calls] consume() END: processed %d chars, clean output=%d chars, %s",
+		initialLen-len(bufStr), clean.Len(), a.dumpState())
+
 	return clean.String()
 }
 
@@ -117,17 +145,22 @@ func (a *ToolCallAccumulator) finalizeCall() {
 	rawID := strings.TrimSpace(a.currentIDBuf.String())
 	rawArgs := strings.TrimSpace(a.currentArgsBuf.String())
 
+	logger.Infof("[kimi-tool-calls] FINALIZE CALL: rawID=%q (%d chars), rawArgs=%q (%d chars), inArgs=%v",
+		rawID, len(rawID), rawArgs, len(rawArgs), a.inArgs)
+
 	funcName := rawID
 	if strings.HasPrefix(funcName, "functions.") {
 		funcName = strings.TrimPrefix(funcName, "functions.")
+		logger.Debugf("[kimi-tool-calls] Removed 'functions.' prefix, name now: %q", funcName)
 	}
 
 	if idx := strings.Index(funcName, ":"); idx != -1 {
 		funcName = funcName[:idx]
+		logger.Debugf("[kimi-tool-calls] Extracted function name before ':', name now: %q", funcName)
 	}
 
 	if funcName == "" {
-		logger.Warnf("[kimi-tool-calls] Parsed tool call with EMPTY function name (raw_id=%q). This tool call will likely fail downstream.", rawID)
+		logger.Warnf("[kimi-tool-calls] CRITICAL: Parsed tool call with EMPTY function name (raw_id=%q, raw_args=%q). This tool call will likely fail downstream.", rawID, rawArgs)
 	}
 
 	callID := fmt.Sprintf("call_%s", uuid.New().String()[:24])
@@ -137,12 +170,14 @@ func (a *ToolCallAccumulator) finalizeCall() {
 	if err := json.Unmarshal([]byte(rawArgs), &argsObj); err == nil {
 		argsBytes, _ := json.Marshal(argsObj)
 		argsStr = string(argsBytes)
+		logger.Debugf("[kimi-tool-calls] Successfully parsed args as JSON")
 	} else {
 		argsPreview := rawArgs
 		if len(argsPreview) > 200 {
 			argsPreview = argsPreview[:200] + "..."
 		}
-		logger.Warnf("[kimi-tool-calls] Could not parse tool call arguments as valid JSON for '%s' (call_id=%s): %s", funcName, callID, argsPreview)
+		logger.Warnf("[kimi-tool-calls] JSON PARSE ERROR for '%s' (call_id=%s): %v | raw_args=%q",
+			funcName, callID, err, argsPreview)
 		argsStr = rawArgs
 	}
 
@@ -156,7 +191,8 @@ func (a *ToolCallAccumulator) finalizeCall() {
 	if len(argsPreview) > 120 {
 		argsPreview = argsPreview[:120] + "..."
 	}
-	logger.Debugf("[kimi-tool-calls] Parsed tool call: %s (call_id=%s) args=%s", funcName, callID, argsPreview)
+	logger.Debugf("[kimi-tool-calls] FINALIZE CALL END: Added tool call #%d: %s (call_id=%s) args=%s",
+		len(a.toolCalls), funcName, callID, argsPreview)
 
 	a.inCall = false
 	a.inArgs = false
@@ -170,6 +206,7 @@ func isPartialTokenPrefix(buf string) bool {
 	}
 	for _, tok := range toolTokens {
 		if strings.HasPrefix(tok, buf) && buf != tok {
+			logger.Debugf("[kimi-tool-calls] Partial token prefix detected: %q (matches %q)", buf, tok)
 			return true
 		}
 	}
@@ -180,11 +217,45 @@ func containsToolTokens(text string) bool {
 	if text == "" {
 		return false
 	}
-	return strings.Contains(text, TOK_SECTION_BEGIN) ||
+	result := strings.Contains(text, TOK_SECTION_BEGIN) ||
 		strings.Contains(text, TOK_SECTION_END) ||
 		strings.Contains(text, TOK_CALL_BEGIN) ||
 		strings.Contains(text, TOK_CALL_END) ||
 		strings.Contains(text, TOK_ARG_BEGIN)
+
+	if result {
+		logger.Debugf("[kimi-tool-calls] Tool tokens detected in text (len=%d): section_begin=%v, section_end=%v, call_begin=%v, call_end=%v, arg_begin=%v",
+			len(text),
+			strings.Contains(text, TOK_SECTION_BEGIN),
+			strings.Contains(text, TOK_SECTION_END),
+			strings.Contains(text, TOK_CALL_BEGIN),
+			strings.Contains(text, TOK_CALL_END),
+			strings.Contains(text, TOK_ARG_BEGIN))
+	}
+	return result
+}
+
+// dumpState returns a string representation of the current accumulator state for debugging
+func (a *ToolCallAccumulator) dumpState() string {
+	idBuf := a.currentIDBuf.String()
+	argsBuf := a.currentArgsBuf.String()
+	buffer := a.buffer.String()
+
+	idPreview := idBuf
+	if len(idPreview) > 50 {
+		idPreview = idPreview[:50] + "..."
+	}
+	argsPreview := argsBuf
+	if len(argsPreview) > 100 {
+		argsPreview = argsPreview[:100] + "..."
+	}
+	bufferPreview := buffer
+	if len(bufferPreview) > 100 {
+		bufferPreview = bufferPreview[:100] + "..."
+	}
+
+	return fmt.Sprintf("state{inSection=%v, inCall=%v, inArgs=%v, idBuf=%q, argsBuf=%q, buffer=%q, toolCalls=%d}",
+		a.inSection, a.inCall, a.inArgs, idPreview, argsPreview, bufferPreview, len(a.toolCalls))
 }
 
 var toolSectionRegex = regexp.MustCompile(
@@ -363,16 +434,24 @@ func (t *KimiToolCallsTransformer) transformStreaming(body []byte) ([]byte, erro
 
 func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool, newChunk []byte, keepChunk bool) {
 	line := strings.TrimSpace(string(chunk))
+	chunkSize := len(chunk)
+
+	logger.Debugf("[kimi-tool-calls] TransformStream START: chunk_size=%d, sawToolTokens=%v, finished=%v, toolCalls=%d, state=%s",
+		chunkSize, t.sawToolTokens, t.accumulator.finished, len(t.accumulator.toolCalls), t.accumulator.dumpState())
 
 	if line == "" || line == "\n" {
+		logger.Debugf("[kimi-tool-calls] TransformStream: empty line, skipping")
 		return false, chunk, true
 	}
 
 	if strings.HasPrefix(line, ":") {
+		logger.Debugf("[kimi-tool-calls] TransformStream: comment line, skipping")
 		return false, chunk, true
 	}
 
 	if line == "data: [DONE]" {
+		logger.Debugf("[kimi-tool-calls] TransformStream: received [DONE], pending toolCalls=%d, emitted=%d",
+			len(t.accumulator.toolCalls), len(t.emittedToolCalls))
 		if len(t.accumulator.toolCalls) > 0 {
 			logf("Stream [DONE]: flushing %d remaining tool call(s)", len(t.accumulator.toolCalls))
 			for _, tc := range t.accumulator.toolCalls {
@@ -424,15 +503,14 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 		return false, newChunk, false
 	}
 
-	if !strings.HasPrefix(line, "data: ") {
+	jsonStr := line
+	var chunkData map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonStr), &chunkData); err != nil {
+		logger.Debugf("[kimi-tool-calls] TransformStream: JSON parse error: %v | jsonStr=%q", err, jsonStr[:min(len(jsonStr), 200)])
 		return false, chunk, true
 	}
 
-	jsonStr := line[len("data: "):]
-	var chunkData map[string]interface{}
-	if err := json.Unmarshal([]byte(jsonStr), &chunkData); err != nil {
-		return false, chunk, true
-	}
+	logger.Debugf("[kimi-tool-calls] TransformStream: parsed JSON successfully")
 
 	if usage, ok := chunkData["usage"].(map[string]interface{}); ok {
 		if pt, ok := usage["prompt_tokens"].(float64); ok {
@@ -479,7 +557,11 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 	if rc, ok := delta["reasoning_content"].(string); ok {
 		t.outputTokens += int64(len(rc)) / 4
 		if containsToolTokens(rc) || t.accumulator.inSection || t.accumulator.inCall {
+			logger.Infof("[kimi-tool-calls] Processing reasoning_content chunk: len=%d, inSection=%v, inCall=%v",
+				len(rc), t.accumulator.inSection, t.accumulator.inCall)
 			clean := t.accumulator.feed(rc)
+			logger.Infof("[kimi-tool-calls] After feed: clean_output=%d chars, toolCalls=%d, finished=%v",
+				len(clean), len(t.accumulator.toolCalls), t.accumulator.finished)
 			if clean != "" {
 				delta["reasoning_content"] = clean
 			} else {
@@ -504,7 +586,11 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 
 	if t.accumulator.finished && len(t.accumulator.toolCalls) > 0 {
 		t.sawToolTokens = true
-		logf("Emitting %d parsed tool call(s) into stream", len(t.accumulator.toolCalls))
+		logger.Infof("[kimi-tool-calls] EMITTING %d tool call(s) into stream", len(t.accumulator.toolCalls))
+		for i, tc := range t.accumulator.toolCalls {
+			logger.Infof("[kimi-tool-calls] Tool call #%d: %s (id=%s, args=%d chars)",
+				i+1, tc.FunctionName, tc.CallID, len(tc.Arguments))
+		}
 
 		if modified {
 			hasContent := delta["reasoning_content"] != nil || delta["content"] != nil || delta["role"] != nil
@@ -664,4 +750,12 @@ func parseToolCallsFromText(text string) (string, []ParsedToolCall) {
 	acc.buffer.Reset()
 	logf("Parsed %d tool calls in %v", len(acc.toolCalls), time.Since(startTime))
 	return clean, acc.toolCalls
+}
+
+// min returns the smaller of a and b
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

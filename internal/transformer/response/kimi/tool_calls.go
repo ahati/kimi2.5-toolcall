@@ -163,7 +163,12 @@ func (a *ToolCallAccumulator) finalizeCall() {
 		logger.Warnf("[kimi-tool-calls] CRITICAL: Parsed tool call with EMPTY function name (raw_id=%q, raw_args=%q). This tool call will likely fail downstream.", rawID, rawArgs)
 	}
 
-	callID := fmt.Sprintf("call_%s", uuid.New().String()[:24])
+	// Preserve native function_id from model (e.g., "functions.get_weather:0")
+	// This matches Dynamo/vllm/sglang behavior for Kimi K2 compatibility
+	callID := rawID
+	if callID == "" {
+		callID = fmt.Sprintf("call_%s", uuid.New().String()[:24])
+	}
 
 	var argsStr string
 	var argsObj map[string]interface{}
@@ -370,20 +375,9 @@ func (t *KimiToolCallsTransformer) transformNonStreaming(body []byte) ([]byte, e
 
 		allToolCalls := []interface{}{}
 
-		if rc, ok := msg["reasoning_content"].(string); ok && containsToolTokens(rc) {
-			logf("Choice %d has tool tokens in reasoning_content, parsing...", i)
-			cleanRC, tc := parseToolCallsFromText(rc)
-			cleanRC = strings.TrimRight(cleanRC, " \n")
-			if cleanRC != "" {
-				msg["reasoning_content"] = cleanRC
-			} else {
-				delete(msg, "reasoning_content")
-			}
-			logf("Choice %d: parsed %d tool calls from reasoning_content", i, len(tc))
-			for _, ptc := range tc {
-				allToolCalls = append(allToolCalls, toolCallToJSON(ptc))
-			}
-		}
+		// Tool calls should only be in content field after reasoning transformer
+		// Reasoning transformer extracts thinking blocks into reasoning_content
+		_ = msg["reasoning_content"] // Acknowledge field exists but don't parse tool calls from it
 
 		if content, ok := msg["content"].(string); ok && containsToolTokens(content) {
 			logf("Choice %d has tool tokens in content, parsing...", i)
@@ -500,7 +494,8 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 		if t.sawToolTokens {
 			logf("Stream complete — tool call tokens were intercepted and converted")
 		}
-		return false, newChunk, false
+		// Always include the [DONE] chunk in the output to properly terminate the stream
+		return true, append(newChunk, []byte("data: [DONE]\n\n")...), false
 	}
 
 	jsonStr := line
@@ -554,21 +549,12 @@ func (t *KimiToolCallsTransformer) TransformStream(chunk []byte) (modified bool,
 
 	modified = false
 
+	// Tool calls should only be in content field after reasoning transformer
+	// Reasoning transformer extracts thinking blocks into reasoning_content
 	if rc, ok := delta["reasoning_content"].(string); ok {
+		// Just count tokens, don't process tool calls from reasoning_content
 		t.outputTokens += int64(len(rc)) / 4
-		if containsToolTokens(rc) || t.accumulator.inSection || t.accumulator.inCall {
-			logger.Infof("[kimi-tool-calls] Processing reasoning_content chunk: len=%d, inSection=%v, inCall=%v",
-				len(rc), t.accumulator.inSection, t.accumulator.inCall)
-			clean := t.accumulator.feed(rc)
-			logger.Infof("[kimi-tool-calls] After feed: clean_output=%d chars, toolCalls=%d, finished=%v",
-				len(clean), len(t.accumulator.toolCalls), t.accumulator.finished)
-			if clean != "" {
-				delta["reasoning_content"] = clean
-			} else {
-				delete(delta, "reasoning_content")
-			}
-			modified = true
-		}
+		_ = rc
 	}
 
 	if content, ok := delta["content"].(string); ok {

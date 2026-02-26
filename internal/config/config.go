@@ -38,6 +38,9 @@ func DefaultConfig() *Config {
 		LogLevel: "info",
 		Timeout:  10 * time.Minute,
 		Transformers: map[string]any{
+			"kimi-reasoning": map[string]any{
+				"enabled": true,
+			},
 			"kimi-tool-calls": map[string]any{
 				"enabled": true,
 			},

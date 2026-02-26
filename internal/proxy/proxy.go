@@ -44,6 +44,7 @@ func New(cfg *config.Config) *Proxy {
 		transformer: func() *transformer.Registry {
 			r := transformer.NewRegistry()
 			r.RegisterRequest(anthropic.NewAnthropicToOpenAITransformer())
+			r.RegisterResponse(kimi.NewKimiReasoningTransformer())
 			r.RegisterResponse(kimi.NewKimiToolCallsTransformer())
 			r.RegisterResponse(anthropicResp.NewOpenAIToAnthropicTransformer())
 			return r

@@ -673,28 +673,45 @@ func (h *Handler) handleStreaming(c *gin.Context, upstreamURL string, bodyBytes 
 
 		jsonStr := line[len("data: "):]
 		chunkSize := len(jsonStr)
+		currentChunk := []byte(jsonStr)
+		hasTransformedContent := false
 
+		// Chain transformers sequentially - output of one becomes input of next
 		for _, st := range streamingTransformers {
 			t0 := time.Now()
-			modified, newChunk, keepChunk := st.TransformStream([]byte(jsonStr))
+			modified, newChunk, keepChunk := st.TransformStream(currentChunk)
 			transformTime := time.Since(t0)
 
 			if transformTime > 50*time.Millisecond {
 				logger.Warnf("[REQ-%d][%s] Slow transform (%s): %v for chunk %d (size: %d)", 0, "HTTP", st.Name(), transformTime, chunkCount, chunkSize)
 			}
 
-			if modified && len(newChunk) > 0 {
-				c.Writer.Write(newChunk)
-				c.Writer.Flush()
+			if modified {
+				if len(newChunk) > 0 {
+					// Use transformed chunk as input for next transformer
+					currentChunk = newChunk
+					hasTransformedContent = true
+				}
 				if !keepChunk {
-					continue
+					// Transformer consumed the chunk, don't pass to next
+					break
 				}
 			}
-			if !modified || keepChunk {
-				c.Writer.Write([]byte(line + "\n\n"))
-				c.Writer.Flush()
-			}
+			// If not modified, currentChunk stays the same for next transformer
 		}
+
+		// Write the final transformed (or original) chunk
+		// Only write transformed content if we actually have some
+		if hasTransformedContent && len(currentChunk) > 0 {
+			c.Writer.Write(currentChunk)
+			c.Writer.Flush()
+		} else if !hasTransformedContent {
+			// No transformation produced output - write original
+			c.Writer.Write([]byte(line + "\n\n"))
+			c.Writer.Flush()
+		}
+		// If hasTransformedContent is true but currentChunk is empty,
+		// the chunk was consumed by transformer - write nothing
 	}
 
 	// Drain any remaining bytes from backend stream to prevent backend from seeing connection reset
